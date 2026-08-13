@@ -1,0 +1,11 @@
+settings.json
+notifier.log
+playback.lock
+sounds/
+backup-*/
+backup-install-*/
+ui-*.png
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
