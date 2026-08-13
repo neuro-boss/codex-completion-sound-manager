@@ -17,6 +17,7 @@ function Initialize-SoundRuStorage {
 
 function Get-DefaultSoundPath {
     $candidates = @(
+        (Join-Path $soundRuRoot 'assets\default-sound.mp3'),
         (Join-Path $env:WINDIR 'Media\Windows Background.wav'),
         (Join-Path $env:WINDIR 'Media\Windows Notify System Generic.wav'),
         (Join-Path $env:WINDIR 'Media\notify.wav')

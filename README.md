@@ -7,6 +7,7 @@ A lightweight Windows app that plays a custom sound whenever a Codex task finish
 ## Highlights
 
 - Global completion sounds for Codex tasks on Windows
+- A calm bundled completion sound that works immediately after installation
 - WAV and MP3 support, with files stored locally
 - Adjustable volume and repeat count
 - Light and dark themes
@@ -28,7 +29,7 @@ A lightweight Windows app that plays a custom sound whenever a Codex task finish
 1. Download this repository as a ZIP and extract it, or clone it with Git.
 2. Run `Install.ps1`.
 3. Open **Codex Completion Sound Manager** from the desktop shortcut.
-4. Choose a WAV or MP3 file, adjust the volume, and select **Preview**.
+4. Select **Preview** to hear the bundled sound, or choose your own WAV or MP3 file.
 5. Select **Apply to Codex**.
 6. Fully quit and reopen Codex once.
 
@@ -69,6 +70,7 @@ The app stores its data next to the installed script:
 ```text
 settings.json       Local preferences
 sounds\             Imported WAV and MP3 files
+assets\default-sound.mp3  Bundled default completion sound
 notifier.log        Local diagnostic log
 playback.lock       Temporary overlap-protection lock
 ```
@@ -92,6 +94,8 @@ Nothing is uploaded. The app does not read conversation content, API keys, or ac
 
 This is an independent PowerShell/WPF implementation. Its feature direction was inspired in part by the open-source [miao8818/codex-sound-manager](https://github.com/miao8818/codex-sound-manager) project.
 
+The bundled **Clear Bell Chime** sound is by [Universfield](https://pixabay.com/users/universfield-28281460/) via [Pixabay](https://pixabay.com/sound-effects/film-special-effects-clear-bell-chime-487898/). See [Third-party notices](THIRD_PARTY_NOTICES.md).
+
 ## License
 
-[MIT](LICENSE)
+The application code is available under the [MIT License](LICENSE). The bundled audio is provided under the Pixabay Content License and is not covered by the MIT License; see [Third-party notices](THIRD_PARTY_NOTICES.md).
