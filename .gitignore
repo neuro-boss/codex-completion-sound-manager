@@ -1,6 +1,7 @@
 settings.json
 notifier.log
 playback.lock
+notification-cooldown.txt
 sounds/
 backup-*/
 backup-install-*/

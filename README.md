@@ -10,6 +10,7 @@ A lightweight Windows app that plays a custom sound whenever a Codex task finish
 - A calm bundled completion sound that works immediately after installation
 - WAV and MP3 support, with files stored locally
 - Adjustable volume and repeat count
+- A 10-second cooldown that suppresses duplicate completion signals without delaying the first sound
 - Light and dark themes
 - English, Russian, Spanish, German, and Simplified Chinese interfaces
 - Protection against overlapping notifications

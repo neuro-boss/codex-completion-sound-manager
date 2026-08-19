@@ -10,6 +10,8 @@ $soundRuSettingsPath = Join-Path $soundRuRoot 'settings.json'
 $soundRuSoundsPath = Join-Path $soundRuRoot 'sounds'
 $soundRuLogPath = Join-Path $soundRuRoot 'notifier.log'
 $soundRuLockPath = Join-Path $soundRuRoot 'playback.lock'
+$soundRuNotificationCooldownPath = Join-Path $soundRuRoot 'notification-cooldown.txt'
+$soundRuNotificationCooldownSeconds = 10
 
 function Initialize-SoundRuStorage {
     New-Item -ItemType Directory -Path $soundRuRoot, $soundRuSoundsPath -Force | Out-Null
@@ -93,6 +95,50 @@ function Enter-SoundRuPlaybackLock {
 
 function Exit-SoundRuPlaybackLock {
     Remove-Item -LiteralPath $soundRuLockPath -Force -ErrorAction SilentlyContinue
+}
+
+function Test-SoundRuNotificationCooldown {
+    param([int]$MinimumSeconds = $soundRuNotificationCooldownSeconds)
+
+    Initialize-SoundRuStorage
+    $stateStream = $null
+    try {
+        $stateStream = [System.IO.File]::Open($soundRuNotificationCooldownPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $stateText = ''
+        if ($stateStream.Length -gt 0) {
+            $readLength = [int][Math]::Min(128, $stateStream.Length)
+            $buffer = New-Object byte[] $readLength
+            [void]$stateStream.Read($buffer, 0, $readLength)
+            $stateText = [System.Text.Encoding]::UTF8.GetString($buffer).Trim()
+        }
+
+        $nowUtc = [DateTime]::UtcNow
+        $lastNotificationUtc = $null
+        if ($stateText) {
+            try {
+                $lastNotificationUtc = [DateTime]::Parse($stateText, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+            } catch {}
+        }
+        if ($lastNotificationUtc) {
+            $elapsedSeconds = ($nowUtc - $lastNotificationUtc).TotalSeconds
+            if ($elapsedSeconds -ge 0 -and $elapsedSeconds -lt $MinimumSeconds) {
+                Write-SoundRuLog "Повторное уведомление пропущено: прошло $([Math]::Floor($elapsedSeconds)) из $MinimumSeconds сек."
+                return $false
+            }
+        }
+
+        $stateBytes = [System.Text.Encoding]::UTF8.GetBytes($nowUtc.ToString('O', [System.Globalization.CultureInfo]::InvariantCulture))
+        $stateStream.SetLength(0)
+        $stateStream.Position = 0
+        $stateStream.Write($stateBytes, 0, $stateBytes.Length)
+        $stateStream.Flush()
+        return $true
+    } catch {
+        Write-SoundRuLog "Не удалось проверить паузу уведомлений: $($_.Exception.Message)"
+        return $true
+    } finally {
+        if ($stateStream) { $stateStream.Dispose() }
+    }
 }
 
 function Invoke-SoundRuAudioPlayer {
@@ -1265,7 +1311,9 @@ if ($ArgumentsFromCodex -contains '--notify') {
         $notificationSettings = Get-SoundRuSettings
         $payload = @($ArgumentsFromCodex | Where-Object { $_ -ne '--notify' })
         Invoke-PreviousNotifier -Settings $notificationSettings -PayloadArguments $payload
-        Invoke-SoundRuPlayback -Settings $notificationSettings -PayloadArguments $payload
+        if (Test-SoundRuNotificationCooldown) {
+            Invoke-SoundRuPlayback -Settings $notificationSettings -PayloadArguments $payload
+        }
     } catch {
         Write-SoundRuLog "Необработанная ошибка уведомления: $($_.Exception.Message)"
     }
