@@ -10,6 +10,11 @@ $soundRuSettingsPath = Join-Path $soundRuRoot 'settings.json'
 $soundRuSoundsPath = Join-Path $soundRuRoot 'sounds'
 $soundRuLogPath = Join-Path $soundRuRoot 'notifier.log'
 $soundRuLockPath = Join-Path $soundRuRoot 'playback.lock'
+$soundRuNotificationCooldownPath = Join-Path $soundRuRoot 'notification-cooldown.txt'
+$soundRuNotificationCooldownSeconds = 10
+$soundRuHooksPath = Join-Path $soundRuCodexHome 'hooks.json'
+$soundRuCompletionHookPath = Join-Path $soundRuRoot 'CodexCompletionHook.ps1'
+$soundRuSemanticCompletionMarkerPath = Join-Path $soundRuRoot 'semantic-completion.enabled'
 
 function Initialize-SoundRuStorage {
     New-Item -ItemType Directory -Path $soundRuRoot, $soundRuSoundsPath -Force | Out-Null
@@ -93,6 +98,50 @@ function Enter-SoundRuPlaybackLock {
 
 function Exit-SoundRuPlaybackLock {
     Remove-Item -LiteralPath $soundRuLockPath -Force -ErrorAction SilentlyContinue
+}
+
+function Test-SoundRuNotificationCooldown {
+    param([int]$MinimumSeconds = $soundRuNotificationCooldownSeconds)
+
+    Initialize-SoundRuStorage
+    $stateStream = $null
+    try {
+        $stateStream = [System.IO.File]::Open($soundRuNotificationCooldownPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $stateText = ''
+        if ($stateStream.Length -gt 0) {
+            $readLength = [int][Math]::Min(128, $stateStream.Length)
+            $buffer = New-Object byte[] $readLength
+            [void]$stateStream.Read($buffer, 0, $readLength)
+            $stateText = [System.Text.Encoding]::UTF8.GetString($buffer).Trim()
+        }
+
+        $nowUtc = [DateTime]::UtcNow
+        $lastNotificationUtc = $null
+        if ($stateText) {
+            try {
+                $lastNotificationUtc = [DateTime]::Parse($stateText, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+            } catch {}
+        }
+        if ($lastNotificationUtc) {
+            $elapsedSeconds = ($nowUtc - $lastNotificationUtc).TotalSeconds
+            if ($elapsedSeconds -ge 0 -and $elapsedSeconds -lt $MinimumSeconds) {
+                Write-SoundRuLog "Повторное уведомление пропущено: прошло $([Math]::Floor($elapsedSeconds)) из $MinimumSeconds сек."
+                return $false
+            }
+        }
+
+        $stateBytes = [System.Text.Encoding]::UTF8.GetBytes($nowUtc.ToString('O', [System.Globalization.CultureInfo]::InvariantCulture))
+        $stateStream.SetLength(0)
+        $stateStream.Position = 0
+        $stateStream.Write($stateBytes, 0, $stateBytes.Length)
+        $stateStream.Flush()
+        return $true
+    } catch {
+        Write-SoundRuLog "Не удалось проверить паузу уведомлений: $($_.Exception.Message)"
+        return $true
+    } finally {
+        if ($stateStream) { $stateStream.Dispose() }
+    }
 }
 
 function Invoke-SoundRuAudioPlayer {
@@ -183,15 +232,133 @@ function ConvertTo-TomlString {
     return $Value.Replace('\', '\\').Replace('"', '\"')
 }
 
-function Backup-SoundRuConfig {
-    param([Parameter(Mandatory)][string]$ConfigPath)
-    if (Test-Path -LiteralPath $ConfigPath) {
+function Backup-SoundRuFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-Path -LiteralPath $Path) {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $backup = "$ConfigPath.before-codex-sound-manager-$stamp.bak"
-        Copy-Item -LiteralPath $ConfigPath -Destination $backup -ErrorAction Stop
+        $backup = "$Path.before-codex-sound-manager-$stamp.bak"
+        Copy-Item -LiteralPath $Path -Destination $backup -ErrorAction Stop
         return $backup
     }
     return $null
+}
+
+function Get-SoundRuHooksDocument {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{} }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if (-not $raw -or -not $raw.Trim()) { return [pscustomobject]@{} }
+        $document = $raw | ConvertFrom-Json
+        if ($null -eq $document -or $document -is [array]) { throw 'The JSON root must be an object.' }
+        return $document
+    } catch {
+        throw "Unable to read $Path. It was not changed: $($_.Exception.Message)"
+    }
+}
+
+function Save-SoundRuHooksDocument {
+    param([Parameter(Mandatory)]$Document, [Parameter(Mandatory)][string]$Path)
+    $json = $Document | ConvertTo-Json -Depth 12
+    [System.IO.File]::WriteAllText($Path, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Get-SoundRuHookCommand {
+    $hookPath = $soundRuCompletionHookPath
+    if (-not (Test-Path -LiteralPath $hookPath)) {
+        $hookPath = Join-Path $soundRuRoot 'hooks\CodexCompletionHook.ps1'
+    }
+    if (-not (Test-Path -LiteralPath $hookPath)) {
+        throw "The completion hook was not found: $soundRuCompletionHookPath"
+    }
+    return 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $hookPath.Replace('"', '') + '" -Root "' + $soundRuRoot.Replace('"', '') + '"'
+}
+
+function New-SoundRuSemanticHookGroup {
+    $command = Get-SoundRuHookCommand
+    return [pscustomobject]@{
+        hooks = @(
+            [pscustomobject]@{
+                type = 'command'
+                command = $command
+                commandWindows = $command
+                timeout = 5
+            }
+        )
+    }
+}
+
+function Test-SoundRuOwnHookGroup {
+    param($Group)
+    if ($null -eq $Group) { return $false }
+    $handlersProperty = $Group.PSObject.Properties['hooks']
+    if ($null -eq $handlersProperty) { return $false }
+    foreach ($handler in @($handlersProperty.Value)) {
+        foreach ($name in @('command', 'commandWindows')) {
+            $property = $handler.PSObject.Properties[$name]
+            if ($null -ne $property -and [string]$property.Value -match '(?i)CodexCompletionHook\.ps1') {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Set-SoundRuSemanticHookGroups {
+    param([Parameter(Mandatory)]$Document)
+    $hooksProperty = $Document.PSObject.Properties['hooks']
+    if ($null -eq $hooksProperty) {
+        $hooks = [pscustomobject]@{}
+        $Document | Add-Member -NotePropertyName hooks -NotePropertyValue $hooks
+    } else {
+        $hooks = $hooksProperty.Value
+        if ($null -eq $hooks -or $hooks -is [array]) { throw 'The hooks property must be an object.' }
+    }
+    foreach ($eventName in @('UserPromptSubmit', 'Stop')) {
+        $eventProperty = $hooks.PSObject.Properties[$eventName]
+        $current = if ($null -ne $eventProperty) { @($eventProperty.Value) } else { @() }
+        $updated = @($current | Where-Object { -not (Test-SoundRuOwnHookGroup $_) })
+        $updated += New-SoundRuSemanticHookGroup
+        if ($null -eq $eventProperty) {
+            $hooks | Add-Member -NotePropertyName $eventName -NotePropertyValue $updated
+        } else {
+            $eventProperty.Value = $updated
+        }
+    }
+}
+
+function Install-SoundRuSemanticHooks {
+    $document = Get-SoundRuHooksDocument -Path $soundRuHooksPath
+    Set-SoundRuSemanticHookGroups -Document $document
+    $backup = Backup-SoundRuFile -Path $soundRuHooksPath
+    Save-SoundRuHooksDocument -Document $document -Path $soundRuHooksPath
+    return $backup
+}
+
+function Remove-SoundRuSemanticHooks {
+    if (-not (Test-Path -LiteralPath $soundRuHooksPath)) { return $null }
+    $document = Get-SoundRuHooksDocument -Path $soundRuHooksPath
+    $hooksProperty = $document.PSObject.Properties['hooks']
+    if ($null -eq $hooksProperty -or $null -eq $hooksProperty.Value -or $hooksProperty.Value -is [array]) { return $null }
+    $hooks = $hooksProperty.Value
+    $changed = $false
+    foreach ($eventName in @('UserPromptSubmit', 'Stop')) {
+        $eventProperty = $hooks.PSObject.Properties[$eventName]
+        if ($null -eq $eventProperty) { continue }
+        $current = @($eventProperty.Value)
+        $updated = @($current | Where-Object { -not (Test-SoundRuOwnHookGroup $_) })
+        if ($updated.Count -eq $current.Count) { continue }
+        $changed = $true
+        if ($updated.Count -eq 0) {
+            [void]$hooks.PSObject.Properties.Remove($eventName)
+        } else {
+            $eventProperty.Value = $updated
+        }
+    }
+    if (-not $changed) { return $null }
+    $backup = Backup-SoundRuFile -Path $soundRuHooksPath
+    Save-SoundRuHooksDocument -Document $document -Path $soundRuHooksPath
+    return $backup
 }
 
 function Apply-SoundRuConfiguration {
@@ -213,15 +380,18 @@ function Apply-SoundRuConfiguration {
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         $Settings.PreviousNotifyLine = $existing.Value
     }
-    $backup = Backup-SoundRuConfig -ConfigPath $configPath
+    $hooksBackup = Install-SoundRuSemanticHooks
+    $backup = Backup-SoundRuFile -Path $configPath
     if ($existing.Success) {
         $text = [regex]::Replace($text, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $notifyLine }, 1)
     } else {
         $text = $notifyLine + [Environment]::NewLine + $text
     }
     [System.IO.File]::WriteAllText($configPath, $text, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($soundRuSemanticCompletionMarkerPath, "semantic-hooks-v1$([Environment]::NewLine)", [System.Text.UTF8Encoding]::new($false))
     Save-SoundRuSettings -Settings $Settings
-    $backupInfo = if ($backup) { "`n$($texts.BackupLabel): $backup" } else { '' }
+    $backupPaths = @($backup, $hooksBackup | Where-Object { $_ })
+    $backupInfo = if ($backupPaths.Count -gt 0) { "`n$($texts.BackupLabel): " + ($backupPaths -join "`n") } else { '' }
     [System.Windows.Forms.MessageBox]::Show("$($texts.ApplySuccess)$backupInfo", $texts.ReadyTitle, 'OK', 'Information') | Out-Null
 }
 
@@ -229,20 +399,28 @@ function Remove-SoundRuConfiguration {
     param([Parameter(Mandatory)]$Settings)
     $texts = Get-SoundRuTranslations -Language ([string]$Settings.Language)
     $configPath = Join-Path $soundRuCodexHome 'config.toml'
-    if (-not (Test-Path -LiteralPath $configPath)) { return }
-    $text = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
+    $text = if (Test-Path -LiteralPath $configPath) { Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 } else { '' }
     $pattern = '(?m)^\s*notify\s*=\s*\[[^\r\n]*CodexSound(?:Ru|Manager)\.ps1[^\r\n]*\]\s*\r?\n?'
-    if ($text -notmatch $pattern) {
+    $configChanged = $text -match $pattern
+    $backup = $null
+    if ($configChanged) {
+        $backup = Backup-SoundRuFile -Path $configPath
+        $replacement = if ($Settings.PreviousNotifyLine) { $Settings.PreviousNotifyLine + [Environment]::NewLine } else { '' }
+        $text = [regex]::Replace($text, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $replacement }, 1)
+        [System.IO.File]::WriteAllText($configPath, $text, [System.Text.UTF8Encoding]::new($false))
+        $Settings.PreviousNotifyLine = $null
+        Save-SoundRuSettings -Settings $Settings
+    }
+    $hooksBackup = Remove-SoundRuSemanticHooks
+    $markerRemoved = Test-Path -LiteralPath $soundRuSemanticCompletionMarkerPath
+    if ($markerRemoved) { Remove-Item -LiteralPath $soundRuSemanticCompletionMarkerPath -Force -ErrorAction SilentlyContinue }
+    if (-not $configChanged -and -not $hooksBackup -and -not $markerRemoved) {
         [System.Windows.Forms.MessageBox]::Show($texts.NotOurs, $texts.NoChanges, 'OK', 'Information') | Out-Null
         return
     }
-    $backup = Backup-SoundRuConfig -ConfigPath $configPath
-    $replacement = if ($Settings.PreviousNotifyLine) { $Settings.PreviousNotifyLine + [Environment]::NewLine } else { '' }
-    $text = [regex]::Replace($text, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $replacement }, 1)
-    [System.IO.File]::WriteAllText($configPath, $text, [System.Text.UTF8Encoding]::new($false))
-    $Settings.PreviousNotifyLine = $null
-    Save-SoundRuSettings -Settings $Settings
-    [System.Windows.Forms.MessageBox]::Show("$($texts.RemoveSuccess)`n$($texts.BackupLabel): $backup", $texts.ReadyTitle, 'OK', 'Information') | Out-Null
+    $backupPaths = @($backup, $hooksBackup | Where-Object { $_ })
+    $backupInfo = if ($backupPaths.Count -gt 0) { "`n$($texts.BackupLabel): " + ($backupPaths -join "`n") } else { '' }
+    [System.Windows.Forms.MessageBox]::Show("$($texts.RemoveSuccess)$backupInfo", $texts.ReadyTitle, 'OK', 'Information') | Out-Null
 }
 
 function Set-SoundRuButtonStyle {
@@ -909,7 +1087,7 @@ function Get-SoundRuTranslations {
             Disable='Отключить'; Apply='Применить к Codex'; DarkTheme='Включить тёмную тему'; LightTheme='Включить светлую тему'
             FileDialogTitle='Выберите звук завершения задачи'; FileTooLarge='Размер звукового файла не должен превышать 50 МБ.'; FileTooLargeTitle='Файл слишком большой'
             ExistingTitle='Существующее уведомление'; ExistingMessage='В config.toml уже есть обработчик уведомлений. Он будет сохранён и восстановлен при отключении менеджера. Продолжить?'
-            ReadyTitle='Готово'; ApplySuccess='Настройка сохранена. Полностью перезапустите Codex, чтобы включить звук.'; BackupLabel='Резервная копия'
+            ReadyTitle='Готово'; ApplySuccess='Настройка сохранена. Полностью перезапустите Codex, затем подтвердите два хука: UserPromptSubmit и Stop (Настройки → Hooks).'; BackupLabel='Резервная копия'
             NoChanges='Без изменений'; NotOurs='Текущий обработчик notify не принадлежит этому менеджеру. Ничего не изменено.'; RemoveSuccess='Интеграция с Codex отключена.'
         }
         en = @{
@@ -922,7 +1100,7 @@ function Get-SoundRuTranslations {
             Disable='Disable'; Apply='Apply to Codex'; DarkTheme='Switch to dark theme'; LightTheme='Switch to light theme'
             FileDialogTitle='Choose a task completion sound'; FileTooLarge='The sound file must not exceed 50 MB.'; FileTooLargeTitle='File is too large'
             ExistingTitle='Existing notification'; ExistingMessage='config.toml already contains a notification handler. It will be saved and restored when this manager is disabled. Continue?'
-            ReadyTitle='Done'; ApplySuccess='Settings saved. Fully restart Codex to enable the sound.'; BackupLabel='Backup'
+            ReadyTitle='Done'; ApplySuccess='Settings saved. Fully restart Codex, then review and trust the UserPromptSubmit and Stop hooks (Settings → Hooks).'; BackupLabel='Backup'
             NoChanges='No changes'; NotOurs='The current notify handler does not belong to this manager. Nothing was changed.'; RemoveSuccess='Codex integration has been disabled.'
         }
         es = @{
@@ -935,7 +1113,7 @@ function Get-SoundRuTranslations {
             Disable='Desactivar'; Apply='Aplicar a Codex'; DarkTheme='Cambiar al tema oscuro'; LightTheme='Cambiar al tema claro'
             FileDialogTitle='Elige un sonido de finalización'; FileTooLarge='El archivo de sonido no debe superar los 50 MB.'; FileTooLargeTitle='Archivo demasiado grande'
             ExistingTitle='Notificación existente'; ExistingMessage='config.toml ya contiene un controlador de notificaciones. Se guardará y restaurará al desactivar este gestor. ¿Continuar?'
-            ReadyTitle='Listo'; ApplySuccess='Configuración guardada. Reinicia Codex por completo para activar el sonido.'; BackupLabel='Copia de seguridad'
+            ReadyTitle='Listo'; ApplySuccess='Configuración guardada. Reinicia Codex por completo y confirma los hooks UserPromptSubmit y Stop (Ajustes → Hooks).'; BackupLabel='Copia de seguridad'
             NoChanges='Sin cambios'; NotOurs='El controlador notify actual no pertenece a este gestor. No se modificó nada.'; RemoveSuccess='La integración con Codex se ha desactivado.'
         }
         de = @{
@@ -948,7 +1126,7 @@ function Get-SoundRuTranslations {
             Disable='Deaktivieren'; Apply='Auf Codex anwenden'; DarkTheme='Dunkles Design aktivieren'; LightTheme='Helles Design aktivieren'
             FileDialogTitle='Abschlusston auswählen'; FileTooLarge='Die Audiodatei darf höchstens 50 MB groß sein.'; FileTooLargeTitle='Datei ist zu groß'
             ExistingTitle='Vorhandene Benachrichtigung'; ExistingMessage='config.toml enthält bereits einen Benachrichtigungs-Handler. Er wird gespeichert und beim Deaktivieren wiederhergestellt. Fortfahren?'
-            ReadyTitle='Fertig'; ApplySuccess='Einstellungen gespeichert. Codex vollständig neu starten, um den Ton zu aktivieren.'; BackupLabel='Sicherung'
+            ReadyTitle='Fertig'; ApplySuccess='Einstellungen gespeichert. Codex vollständig neu starten und dann die Hooks UserPromptSubmit und Stop bestätigen (Einstellungen → Hooks).'; BackupLabel='Sicherung'
             NoChanges='Keine Änderungen'; NotOurs='Der aktuelle notify-Handler gehört nicht zu diesem Manager. Es wurde nichts geändert.'; RemoveSuccess='Die Codex-Integration wurde deaktiviert.'
         }
         zh = @{
@@ -961,7 +1139,7 @@ function Get-SoundRuTranslations {
             Disable='停用'; Apply='应用到 Codex'; DarkTheme='切换到深色主题'; LightTheme='切换到浅色主题'
             FileDialogTitle='选择任务完成提示音'; FileTooLarge='声音文件不能超过 50 MB。'; FileTooLargeTitle='文件过大'
             ExistingTitle='已有通知设置'; ExistingMessage='config.toml 中已有通知处理程序。停用本管理器时会恢复原设置。是否继续？'
-            ReadyTitle='完成'; ApplySuccess='设置已保存。请完全重启 Codex 以启用提示音。'; BackupLabel='备份'
+            ReadyTitle='完成'; ApplySuccess='设置已保存。请完全重启 Codex，然后在“设置 → Hooks”中确认 UserPromptSubmit 和 Stop 两个 Hook。'; BackupLabel='备份'
             NoChanges='未更改'; NotOurs='当前 notify 处理程序不属于本管理器，未进行任何更改。'; RemoveSuccess='已停用 Codex 集成。'
         }
     }
@@ -1264,10 +1442,33 @@ if ($ArgumentsFromCodex -contains '--notify') {
     try {
         $notificationSettings = Get-SoundRuSettings
         $payload = @($ArgumentsFromCodex | Where-Object { $_ -ne '--notify' })
+        if (Test-Path -LiteralPath $soundRuSemanticCompletionMarkerPath) {
+            Write-SoundRuLog 'Turn-complete notification skipped: semantic completion hooks are enabled.'
+            exit 0
+        }
         Invoke-PreviousNotifier -Settings $notificationSettings -PayloadArguments $payload
-        Invoke-SoundRuPlayback -Settings $notificationSettings -PayloadArguments $payload
+        if (Test-SoundRuNotificationCooldown) {
+            Invoke-SoundRuPlayback -Settings $notificationSettings -PayloadArguments $payload
+        }
     } catch {
         Write-SoundRuLog "Необработанная ошибка уведомления: $($_.Exception.Message)"
+    }
+    exit 0
+}
+
+if ($ArgumentsFromCodex -contains '--semantic-complete') {
+    try {
+        $notificationSettings = Get-SoundRuSettings
+        $turnIndex = [array]::IndexOf($ArgumentsFromCodex, '--turn-id')
+        $turnId = if ($turnIndex -ge 0 -and ($turnIndex + 1) -lt $ArgumentsFromCodex.Count) { [string]$ArgumentsFromCodex[$turnIndex + 1] } else { '' }
+        Invoke-SoundRuPlayback -Settings $notificationSettings
+        if ($turnId) {
+            Write-SoundRuLog "Confirmed successful task completion: turn=$turnId."
+        } else {
+            Write-SoundRuLog 'Confirmed successful task completion.'
+        }
+    } catch {
+        Write-SoundRuLog "Unhandled confirmed-completion error: $($_.Exception.Message)"
     }
     exit 0
 }
