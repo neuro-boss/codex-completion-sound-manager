@@ -1,4 +1,6 @@
 ﻿param(
+    [switch]$SemanticComplete,
+    [string]$SemanticTurnId = '',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ArgumentsFromCodex
 )
@@ -1456,11 +1458,11 @@ if ($ArgumentsFromCodex -contains '--notify') {
     exit 0
 }
 
-if ($ArgumentsFromCodex -contains '--semantic-complete') {
+if ($SemanticComplete -or $ArgumentsFromCodex -contains '--semantic-complete') {
     try {
         $notificationSettings = Get-SoundRuSettings
-        $turnIndex = [array]::IndexOf($ArgumentsFromCodex, '--turn-id')
-        $turnId = if ($turnIndex -ge 0 -and ($turnIndex + 1) -lt $ArgumentsFromCodex.Count) { [string]$ArgumentsFromCodex[$turnIndex + 1] } else { '' }
+        $turnIndex = if ($ArgumentsFromCodex) { [array]::IndexOf($ArgumentsFromCodex, '--turn-id') } else { -1 }
+        $turnId = if ($SemanticTurnId) { $SemanticTurnId } elseif ($turnIndex -ge 0 -and ($turnIndex + 1) -lt $ArgumentsFromCodex.Count) { [string]$ArgumentsFromCodex[$turnIndex + 1] } else { '' }
         Invoke-SoundRuPlayback -Settings $notificationSettings
         if ($turnId) {
             Write-SoundRuLog "Confirmed successful task completion: turn=$turnId."

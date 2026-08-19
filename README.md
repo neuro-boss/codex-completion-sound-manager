@@ -7,7 +7,7 @@ A lightweight Windows app that plays a custom sound after a Codex task is actual
 ## Highlights
 
 - Completion sounds for Codex tasks on Windows
-- Semantic completion detection: only a successful `task_complete` record for the submitted turn can start the sound
+- Completion detection based on Codex's `Stop` event for the exact submitted turn
 - No sound when you submit a task, reconnect, or receive a normal intermediate turn notification
 - A calm bundled completion sound that works immediately after installation
 - WAV and MP3 support, with files stored locally
@@ -63,15 +63,14 @@ Keep the project folder in a stable location before selecting **Apply to Codex**
 
 Codex's public `notify` configuration reports that an agent turn ended. That is useful as a compatibility entry point, but it is not specific enough to distinguish a new prompt, a reconnect, or a real completed task. The manager therefore installs two local Codex hooks in `%USERPROFILE%\.codex\hooks.json`:
 
-1. `UserPromptSubmit` records the session ID, turn ID, transcript path, and the byte position at which your task begins. It does not play sound.
-2. `Stop` starts a short-lived local watcher. It reads only newer JSONL rows from that transcript and waits for a successful `task_complete` row with the same turn ID.
-3. On that exact match, the hook starts the manager once with `--semantic-complete`, and the manager plays the selected sound.
+1. `UserPromptSubmit` records the session ID and turn ID when your task begins. It does not play sound.
+2. `Stop` is emitted when Codex finishes that turn. The hook verifies the same turn ID, ignores continuation stops and empty final messages, then plays the selected audio once.
 
-The watcher exits after the completion is found, an error occurs, or 30 minutes pass. The settings window never needs to remain open.
+The settings window never needs to remain open.
 
 The normal `notify` callback remains configured for compatibility, but is deliberately silent while semantic completion is enabled. This prevents the false sound that can otherwise appear right after a prompt is submitted.
 
-Codex documents [hooks](https://learn.chatgpt.com/docs/hooks) as a trusted local extension mechanism. The transcript path is provided by Codex for hook use, but its JSON format is not a stable public interface; a major Codex change may require a manager update.
+Codex documents [hooks](https://learn.chatgpt.com/docs/hooks) as a trusted local extension mechanism. This implementation uses the documented `UserPromptSubmit` and `Stop` events, rather than reading Codex transcript files.
 
 ## Files and privacy
 
@@ -82,13 +81,13 @@ settings.json       Local preferences
 sounds\             Imported WAV and MP3 files
 assets\default-sound.mp3  Bundled default completion sound
 CodexCompletionHook.ps1   Local completion-verification hook
-semantic-state\           Temporary per-turn IDs and offsets
+semantic-state\           Temporary per-turn IDs and timestamps
 semantic-completion.enabled Enables semantic completion mode
 notifier.log        Local diagnostic log
 playback.lock       Temporary overlap-protection lock
 ```
 
-The hooks read the local Codex transcript only to locate a matching completion record after a task begins. They do not upload, transmit, or retain prompt text, API keys, or account information. `semantic-state` holds IDs, a local file path, a byte offset, and a timestamp; it contains no message body.
+The hooks do not read the Codex transcript. They do not upload, transmit, or retain prompt text, API keys, or account information. `semantic-state` holds IDs and a timestamp; it contains no message body.
 
 ## Safety and recovery
 
