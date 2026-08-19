@@ -1,23 +1,23 @@
 # Codex Completion Sound Manager
 
-A lightweight Windows app that plays a custom sound whenever a Codex task finishes. It uses Codex's global `notify` configuration, so the manager does **not** need to stay open in the background.
+A lightweight Windows app that plays a custom sound after a Codex task is actually completed — not when you submit the prompt or when an ordinary turn-status notification arrives.
 
 ![Codex Completion Sound Manager interface](docs/interface.png)
 
 ## Highlights
 
-- Global completion sounds for Codex tasks on Windows
+- Completion sounds for Codex tasks on Windows
+- Semantic completion detection: only a successful `task_complete` record for the submitted turn can start the sound
+- No sound when you submit a task, reconnect, or receive a normal intermediate turn notification
 - A calm bundled completion sound that works immediately after installation
 - WAV and MP3 support, with files stored locally
 - Adjustable volume and repeat count
-- A 10-second cooldown that suppresses duplicate completion signals without delaying the first sound
 - Light and dark themes
 - English, Russian, Spanish, German, and Simplified Chinese interfaces
 - Protection against overlapping notifications
-- Preserves and forwards an existing Codex notifier
-- Creates a backup before changing `config.toml`
-- Restores the previous notifier when the integration is disabled
-- No telemetry, network requests, accounts, or background service
+- Backs up `config.toml` and `hooks.json` before changing either file
+- Preserves unrelated user hooks and restores the previous `notify` configuration when disabled
+- No telemetry, network requests, accounts, or persistent background service
 
 ## Requirements
 
@@ -33,6 +33,7 @@ A lightweight Windows app that plays a custom sound whenever a Codex task finish
 4. Select **Preview** to hear the bundled sound, or choose your own WAV or MP3 file.
 5. Select **Apply to Codex**.
 6. Fully quit and reopen Codex once.
+7. In **Settings → Hooks** (or `/hooks`), review and trust the two hooks installed by this app: `UserPromptSubmit` and `Stop`.
 
 If Windows blocks the installer script, open PowerShell in the project folder and run:
 
@@ -46,7 +47,7 @@ The installer copies the app to:
 %USERPROFILE%\.codex\codex-completion-sound-manager\
 ```
 
-It also creates a desktop shortcut. Existing installed files are backed up before they are replaced.
+It also creates a desktop shortcut. Existing installed files are backed up before they are replaced. The installer itself does not change Codex configuration; **Apply to Codex** does.
 
 ## Portable use
 
@@ -60,9 +61,17 @@ Keep the project folder in a stable location before selecting **Apply to Codex**
 
 ## How it works
 
-The app updates the global `notify` entry in `%USERPROFILE%\.codex\config.toml`. When Codex completes a task, it starts the script in notification mode. The script reads the local settings, plays the selected audio, forwards any previously configured notifier, and exits.
+Codex's public `notify` configuration reports that an agent turn ended. That is useful as a compatibility entry point, but it is not specific enough to distinguish a new prompt, a reconnect, or a real completed task. The manager therefore installs two local Codex hooks in `%USERPROFILE%\.codex\hooks.json`:
 
-The graphical settings window is only needed when you want to change the sound or preferences. It does not need to remain open.
+1. `UserPromptSubmit` records the session ID, turn ID, transcript path, and the byte position at which your task begins. It does not play sound.
+2. `Stop` starts a short-lived local watcher. It reads only newer JSONL rows from that transcript and waits for a successful `task_complete` row with the same turn ID.
+3. On that exact match, the hook starts the manager once with `--semantic-complete`, and the manager plays the selected sound.
+
+The watcher exits after the completion is found, an error occurs, or 30 minutes pass. The settings window never needs to remain open.
+
+The normal `notify` callback remains configured for compatibility, but is deliberately silent while semantic completion is enabled. This prevents the false sound that can otherwise appear right after a prompt is submitted.
+
+Codex documents [hooks](https://learn.chatgpt.com/docs/hooks) as a trusted local extension mechanism. The transcript path is provided by Codex for hook use, but its JSON format is not a stable public interface; a major Codex change may require a manager update.
 
 ## Files and privacy
 
@@ -72,17 +81,21 @@ The app stores its data next to the installed script:
 settings.json       Local preferences
 sounds\             Imported WAV and MP3 files
 assets\default-sound.mp3  Bundled default completion sound
+CodexCompletionHook.ps1   Local completion-verification hook
+semantic-state\           Temporary per-turn IDs and offsets
+semantic-completion.enabled Enables semantic completion mode
 notifier.log        Local diagnostic log
 playback.lock       Temporary overlap-protection lock
 ```
 
-Nothing is uploaded. The app does not read conversation content, API keys, or account information.
+The hooks read the local Codex transcript only to locate a matching completion record after a task begins. They do not upload, transmit, or retain prompt text, API keys, or account information. `semantic-state` holds IDs, a local file path, a byte offset, and a timestamp; it contains no message body.
 
 ## Safety and recovery
 
-- `config.toml` is backed up before every integration change.
-- An existing notifier is saved and forwarded instead of being silently discarded.
-- Selecting **Disable** removes this integration and restores the saved notifier.
+- `config.toml` and `hooks.json` are backed up before every change made by this app.
+- Existing hook entries are preserved. Disable removes only the manager's `UserPromptSubmit` and `Stop` command groups.
+- An existing `notify` command is saved and restored on disable. It is not forwarded while semantic mode is enabled, to avoid reviving an old audio notification.
+- Selecting **Disable** removes the semantic marker, its hook groups, and this manager's `notify` entry; it leaves unrelated configuration intact.
 - Imported audio is copied into the app's local `sounds` directory, so deleting the original file does not break notifications.
 
 ## Uninstall
