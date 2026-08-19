@@ -1,8 +1,5 @@
 param(
-    [switch]$Watch,
-    [string]$StatePath = '',
     [string]$Root = '',
-    [int]$WatchSeconds = 1800,
     [switch]$TestMode
 )
 
@@ -12,7 +9,8 @@ $ErrorActionPreference = 'Stop'
 if (-not $Root) { $Root = $PSScriptRoot }
 $stateDirectory = Join-Path $Root 'semantic-state'
 $logPath = Join-Path $Root 'notifier.log'
-$managerPath = Join-Path $Root 'CodexSoundManager.ps1'
+$settingsPath = Join-Path $Root 'settings.json'
+$playbackLockPath = Join-Path $Root 'semantic-playback.lock'
 
 function Initialize-CompletionState {
     New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
@@ -76,39 +74,88 @@ function Read-JsonFile {
     }
 }
 
-function Get-RecordPayload {
-    param($Record)
-    $nested = Get-PropertyValue -Object $Record -Name 'payload'
-    if ($null -ne $nested -and $nested -is [psobject]) { return $nested }
-    return $Record
-}
-
-function Get-RecordTurnId {
-    param($Record)
-    $payload = Get-RecordPayload $Record
-    foreach ($candidate in @(
-        (Get-PropertyValue $payload 'turn_id'),
-        (Get-PropertyValue $Record 'turn_id')
-    )) {
-        if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
+function Get-CompletionSettings {
+    try {
+        if (-not (Test-Path -LiteralPath $settingsPath)) { return $null }
+        return Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        Write-CompletionLog "Could not read sound settings: $($_.Exception.Message)"
+        return $null
     }
-    $metadata = Get-PropertyValue $payload 'internal_chat_message_metadata_passthrough'
-    $metadataTurn = Get-PropertyValue $metadata 'turn_id'
-    if ($null -ne $metadataTurn -and [string]$metadataTurn) { return [string]$metadataTurn }
-    return ''
 }
 
-function Test-SuccessfulTaskComplete {
-    param($Record, [Parameter(Mandatory)][string]$ExpectedTurnId)
-    if ($null -eq $Record) { return $false }
-    $payload = Get-RecordPayload $Record
-    if ([string](Get-PropertyValue $payload 'type') -ne 'task_complete') { return $false }
-    if ((Get-RecordTurnId $Record) -ne $ExpectedTurnId) { return $false }
-    $status = ([string](Get-PropertyValue $payload 'status')).Trim().ToLowerInvariant()
-    if ($status -in @('failed', 'failure', 'error', 'cancelled', 'canceled', 'aborted')) { return $false }
-    $lastMessage = $payload.PSObject.Properties['last_agent_message']
-    if ($null -ne $lastMessage -and [string]::IsNullOrWhiteSpace([string]$lastMessage.Value)) { return $false }
-    return $true
+function Get-CompletionSoundPath {
+    param($Settings)
+    $selected = if ($null -ne $Settings) { [string](Get-PropertyValue $Settings 'SoundPath') } else { '' }
+    $candidates = @(
+        $selected,
+        (Join-Path $Root 'assets\default-sound.mp3'),
+        (Join-Path $env:WINDIR 'Media\Windows Background.wav'),
+        (Join-Path $env:WINDIR 'Media\Windows Notify System Generic.wav')
+    )
+    return $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+}
+
+function Enter-CompletionPlaybackLock {
+    try {
+        if (Test-Path -LiteralPath $playbackLockPath) {
+            $age = (Get-Date) - (Get-Item -LiteralPath $playbackLockPath).LastWriteTime
+            if ($age.TotalMinutes -gt 5) { Remove-Item -LiteralPath $playbackLockPath -Force -ErrorAction SilentlyContinue }
+        }
+        $stream = [IO.File]::Open($playbackLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Dispose()
+        return $true
+    } catch {
+        Write-CompletionLog 'Confirmed completion skipped: sound is already playing.'
+        return $false
+    }
+}
+
+function Invoke-CompletionSound {
+    $settings = Get-CompletionSettings
+    if ($null -ne $settings -and $settings.PSObject.Properties['Enabled'] -and -not [bool]$settings.Enabled) { return }
+    $soundPath = Get-CompletionSoundPath $settings
+    if (-not $soundPath) {
+        Write-CompletionLog 'Confirmed completion was not played: no audio file was found.'
+        return
+    }
+    if (-not (Enter-CompletionPlaybackLock)) { return }
+    $opened = $false
+    $alias = 'codexcompletionhook'
+    try {
+        if (-not ('CodexCompletionMci' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class CodexCompletionMci {
+    [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
+    public static extern int mciSendString(string command, StringBuilder buffer, int bufferSize, IntPtr callback);
+}
+'@
+        }
+        $extension = [IO.Path]::GetExtension($soundPath).ToLowerInvariant()
+        $deviceType = if ($extension -eq '.wav') { 'waveaudio' } elseif ($extension -eq '.mp3') { 'mpegvideo' } else { throw "Unsupported audio format: $extension" }
+        $openResult = [CodexCompletionMci]::mciSendString(('open "' + $soundPath.Replace('"', '') + '" type ' + $deviceType + ' alias ' + $alias), $null, 0, [IntPtr]::Zero)
+        if ($openResult -ne 0) { throw "Could not open audio file (code $openResult)." }
+        $opened = $true
+        $volume = if ($null -ne $settings -and $settings.PSObject.Properties['Volume']) { [int]$settings.Volume } else { 55 }
+        $volume = [Math]::Min(100, [Math]::Max(0, $volume))
+        [void][CodexCompletionMci]::mciSendString(('setaudio ' + $alias + ' volume to ' + ($volume * 10)), $null, 0, [IntPtr]::Zero)
+        $playCount = if ($null -ne $settings -and $settings.PSObject.Properties['PlayCount']) { [int]$settings.PlayCount } else { 1 }
+        $playCount = [Math]::Min(10, [Math]::Max(1, $playCount))
+        for ($index = 0; $index -lt $playCount; $index++) {
+            $result = [CodexCompletionMci]::mciSendString(('play ' + $alias + ' wait'), $null, 0, [IntPtr]::Zero)
+            if ($result -ne 0) { throw "Could not play audio file (code $result)." }
+            if ($index -lt ($playCount - 1)) { Start-Sleep -Milliseconds 180 }
+        }
+        Write-CompletionLog "Sound played after confirmed completion: $([IO.Path]::GetFileName($soundPath)); volume $volume%."
+    } catch {
+        Write-CompletionLog "Confirmed completion audio error: $($_.Exception.Message)"
+    } finally {
+        if ($opened) { [void][CodexCompletionMci]::mciSendString(('close ' + $alias), $null, 0, [IntPtr]::Zero) }
+        Remove-Item -LiteralPath $playbackLockPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-ConfirmedCompletion {
@@ -121,112 +168,15 @@ function Invoke-ConfirmedCompletion {
         return
     }
     if ($TestMode) {
-        Write-CompletionLog "TEST: successful task_complete found: turn=$($State.TurnId)."
+        Write-CompletionLog "TEST: confirmed task completion: turn=$($State.TurnId)."
         return
     }
-    if (-not (Test-Path -LiteralPath $managerPath)) {
-        Write-CompletionLog "Confirmed completion was not played: manager not found at $managerPath."
-        return
-    }
-    try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $managerPath,
-            '--semantic-complete', '--turn-id', [string]$State.TurnId
-        ) -WindowStyle Hidden
-        Write-CompletionLog "Successful task_complete found: turn=$($State.TurnId); sound started."
-    } catch {
-        Write-CompletionLog "Could not start confirmed-completion sound: $($_.Exception.Message)"
-    }
-}
-
-function Watch-Completion {
-    param([Parameter(Mandatory)][string]$Path)
-    try {
-        $state = Read-JsonFile $Path
-        if ($null -eq $state) { return }
-        $transcriptPath = [string]$state.TranscriptPath
-        $turnId = [string]$state.TurnId
-        if (-not $transcriptPath -or -not $turnId) {
-            Write-CompletionLog 'Completion watch skipped: transcript path or turn ID is missing.'
-            return
-        }
-        $offset = [Math]::Max(0, [long]$state.StartOffset)
-        $pending = ''
-        $lastReadError = ''
-        $deadline = (Get-Date).AddSeconds([Math]::Max(1, $WatchSeconds))
-        while ((Get-Date) -lt $deadline) {
-            try {
-                if (Test-Path -LiteralPath $transcriptPath) {
-                    $bytes = [IO.File]::ReadAllBytes($transcriptPath)
-                    if ($bytes.Length -gt $offset) {
-                        $newText = [Text.Encoding]::UTF8.GetString($bytes, [int]$offset, [int]($bytes.Length - $offset))
-                        $offset = $bytes.Length
-                        $combined = $pending + $newText
-                        $parts = [regex]::Split($combined, "`r?`n")
-                        if ($combined -match "(?:`r?`n)$") {
-                            $pending = ''
-                        } else {
-                            $pending = $parts[$parts.Count - 1]
-                            if ($parts.Count -gt 1) { $parts = $parts[0..($parts.Count - 2)] } else { $parts = @() }
-                        }
-                        foreach ($line in $parts) {
-                            if (-not $line -or -not $line.Trim()) { continue }
-                            try { $record = $line | ConvertFrom-Json } catch { continue }
-                            if (Test-SuccessfulTaskComplete -Record $record -ExpectedTurnId $turnId) {
-                                Invoke-ConfirmedCompletion -State $state -Path $Path
-                                return
-                            }
-                        }
-                        $lastReadError = ''
-                    }
-                }
-            } catch {
-                $message = [string]$_.Exception.Message
-                if ($message -ne $lastReadError) {
-                    Write-CompletionLog "Transcript read will be retried: $message"
-                    $lastReadError = $message
-                }
-            }
-            Start-Sleep -Milliseconds 250
-        }
-        Write-CompletionLog "No confirmed completion found within $WatchSeconds seconds: turn=$turnId. Sound was not played."
-    } finally {
-        Remove-Item -LiteralPath "$Path.watch" -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Start-CompletionWatcher {
-    param([Parameter(Mandatory)][string]$Path)
-    $watchLock = "$Path.watch"
-    try {
-        New-Item -ItemType File -Path $watchLock -ErrorAction Stop | Out-Null
-    } catch {
-        Write-CompletionLog 'Completion watcher is already running for this turn.'
-        return
-    }
-    if ($TestMode) {
-        Watch-Completion -Path $Path
-        return
-    }
-    try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
-            '-Watch', '-StatePath', $Path, '-Root', $Root, '-WatchSeconds', $WatchSeconds
-        ) -WindowStyle Hidden
-        $state = Read-JsonFile $Path
-        if ($state) { Write-CompletionLog "Started waiting for task_complete: turn=$($state.TurnId)." }
-    } catch {
-        Remove-Item -LiteralPath $watchLock -Force -ErrorAction SilentlyContinue
-        Write-CompletionLog "Could not start completion watcher: $($_.Exception.Message)"
-    }
+    Invoke-CompletionSound
+    Write-CompletionLog "Stop confirmed task completion: turn=$($State.TurnId)."
 }
 
 try {
     Initialize-CompletionState
-    if ($Watch) {
-        if ($StatePath) { Watch-Completion -Path $StatePath }
-        exit 0
-    }
     $payload = Read-HookPayload
     if ($null -eq $payload) { exit 0 }
     $eventName = [string](Get-PropertyValue $payload 'hook_event_name')
@@ -239,16 +189,9 @@ try {
     $key = Get-CompletionKey -SessionId $sessionId -TurnId $turnId
     $currentStatePath = Join-Path $stateDirectory "$key.start.json"
     if ($eventName -eq 'UserPromptSubmit') {
-        $transcriptPath = [string](Get-PropertyValue $payload 'transcript_path')
-        $startOffset = 0L
-        if ($transcriptPath -and (Test-Path -LiteralPath $transcriptPath)) {
-            $startOffset = (Get-Item -LiteralPath $transcriptPath).Length
-        }
         $state = [pscustomobject]@{
             SessionId = $sessionId
             TurnId = $turnId
-            TranscriptPath = $transcriptPath
-            StartOffset = $startOffset
             StartedAtUtc = [DateTime]::UtcNow.ToString('O')
         }
         Write-JsonFile -Path $currentStatePath -Value $state
@@ -257,11 +200,21 @@ try {
         exit 0
     }
     if ($eventName -eq 'Stop') {
-        if (Test-Path -LiteralPath $currentStatePath) {
-            Start-CompletionWatcher -Path $currentStatePath
-        } else {
+        if (-not (Test-Path -LiteralPath $currentStatePath)) {
             Write-CompletionLog "Stop skipped: no recorded user start for turn=$turnId."
+            exit 0
         }
+        if ((Get-PropertyValue $payload 'stop_hook_active') -eq $true) {
+            Write-CompletionLog "Stop skipped: this turn was already continued by a Stop hook: turn=$turnId."
+            exit 0
+        }
+        $lastAssistantMessage = [string](Get-PropertyValue $payload 'last_assistant_message')
+        if ([string]::IsNullOrWhiteSpace($lastAssistantMessage)) {
+            Write-CompletionLog "Stop skipped: no final assistant message for turn=$turnId."
+            exit 0
+        }
+        $state = Read-JsonFile $currentStatePath
+        if ($state) { Invoke-ConfirmedCompletion -State $state -Path $currentStatePath }
     }
 } catch {
     Write-CompletionLog "Unhandled completion hook error: $($_.Exception.Message)"
